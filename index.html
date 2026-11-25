@@ -1285,82 +1285,113 @@ CREATE POLICY "Allow public CRUD" ON pocketledger_entries
 
     // Call Real Gemini Vision API if key is set, else smart local parser
     async function analyzeSlipWithAI(file, captionText) {
-      if (geminiApiKey && geminiApiKey.length > 10) {
-        try {
-          const prompt = `You are an expert accounting assistant in Kerala, India. Analyze this bank slip image and/or WhatsApp message caption: "${captionText}".
-1. Extract the actual customer or vendor Party Name (prioritize the name in the caption so you don't mistake a bank branch rubber stamp like SBI/Federal Bank for the person).
-2. Extract the bank branch stamp or UTR reference into bank_stamp_details.
-3. Extract the numeric amount in INR.
-4. Set transaction_type to "income" or "expense".
-5. Set category (e.g. "Customer Sales", "Supplier / Vendor", "Utilities & Electricity", "Freelance / Fees").
-6. Set gst_rate (0, 5, 12, or 18).
-Return ONLY valid JSON: {"party_name": "...", "bank_stamp_details": "...", "amount": 1000, "transaction_type": "income", "category": "Customer Sales", "gst_rate": 0}`;
+      const today = new Date().toISOString().slice(0, 10);
+      const trimmedCaption = (captionText || '').trim();
+      let lastApiError = '';
 
-          const parts = [{ text: prompt }];
-          if (file) {
-            const imgData = await fileToBase64(file);
-            parts.push({
-              inline_data: {
-                mime_type: imgData.mimeType,
-                data: imgData.base64
-              }
-            });
-          }
+      if (geminiApiKey && geminiApiKey.trim().length > 10) {
+        const cleanKey = geminiApiKey.trim();
+        const prompt = `You are an expert accounting assistant in Kerala, India. Analyze this bank slip / NEFT receipt image and/or message caption: "${trimmedCaption}". Today's date is ${today}.
+Rules:
+1. Extract the Account Name / Beneficiary / Remitter / Remarks printed on the slip into "account_name" (e.g. "FINEPACK" from "Payment initiated to FINEPACK" or "Remarks: FINEPACK").
+2. Extract the Bank Name + payment mode + Transaction ID / UTR / branch stamp into "bank_stamp_details" (e.g. "Federal Bank NEFT • SMEMB262385f3a0000").
+3. Extract the numeric amount in INR into "amount" (convert Indian comma format like 1,50,000 to 150000).
+4. Set "transaction_type" to "expense" if the slip says "Payment initiated to", "Paid to", "Debited", or shows "Debit A/C"; set "income" if "Credited" or "Received from".
+5. Set "category" (e.g. "Supplier / Vendor", "Customer Sales", "Utilities & Electricity", "Freelance / Fees").
+6. Set "gst_rate" (0, 5, 12, or 18).
+Return ONLY valid JSON: {"account_name": "FINEPACK", "bank_stamp_details": "Federal Bank NEFT • SMEMB262385f3a0000", "amount": 150000, "transaction_type": "expense", "category": "Supplier / Vendor", "gst_rate": 0}`;
 
-          const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${encodeURIComponent(geminiApiKey)}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ contents: [{ parts }] })
+        const parts = [{ text: prompt }];
+        if (file) {
+          const imgData = await fileToBase64(file);
+          parts.push({
+            inline_data: {
+              mime_type: imgData.mimeType,
+              data: imgData.base64
+            }
           });
+        }
 
-          if (resp.ok) {
+        let models = ['gemini-3.8-flash', 'gemini-2.5-flash'];
+        try {
+          const listResp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(cleanKey)}`);
+          if (listResp.ok) {
+            const listJson = await listResp.json();
+            const liveFlash = (listJson.models || [])
+              .filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes('generateContent') && /flash/i.test(m.name))
+              .map(m => m.name.replace(/^models\//, ''))
+              .reverse();
+            if (liveFlash.length > 0) models = [...new Set(['gemini-3.8-flash', ...liveFlash])];
+          }
+        } catch (e) {}
+
+        for (const model of models) {
+          try {
+            const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(cleanKey)}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                contents: [{ parts }],
+                generationConfig: { responseMimeType: 'application/json' }
+              })
+            });
+
             const json = await resp.json();
+            if (!resp.ok) {
+              lastApiError = `${model}: ${json?.error?.message || 'HTTP ' + resp.status}`;
+              continue;
+            }
+
             const rawText = json.candidates?.[0]?.content?.parts?.[0]?.text || '';
-            const cleaned = rawText.replace(/```json/gi, '').replace(/```/g, '').trim();
-            const parsed = JSON.parse(cleaned);
+            const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+            if (!jsonMatch) {
+              lastApiError = 'Unreadable AI response';
+              continue;
+            }
+
+            const parsed = JSON.parse(jsonMatch[0]);
+            const acctName = String(parsed.account_name || parsed.party_name || '').trim();
+            const stampText = String(parsed.bank_stamp_details || 'Verified Bank Slip').trim();
+
+            // Caption is always the Party Name; Account Name goes into Description / Bank Stamp
+            const finalParty = trimmedCaption || acctName || 'Customer Account';
+            let combinedStamp = stampText;
+            if (acctName && !stampText.toLowerCase().includes(acctName.toLowerCase())) {
+              combinedStamp = `A/C: ${acctName} • ${stampText}`;
+            }
+
             return {
-              desc: parsed.party_name || captionText || 'Customer Account',
-              bankStamp: parsed.bank_stamp_details || 'Verified Bank Slip',
-              amount: Number(parsed.amount) || 5000,
+              desc: finalParty,
+              bankStamp: combinedStamp,
+              amount: Number(String(parsed.amount || 0).replace(/,/g, '')) || 0,
               type: parsed.transaction_type === 'expense' ? 'expense' : 'income',
-              category: parsed.category || 'Customer Sales',
+              category: parsed.category || (parsed.transaction_type === 'expense' ? 'Supplier / Vendor' : 'Customer Sales'),
               gstRate: Number(parsed.gst_rate || 0),
               usedLiveAi: true
             };
+          } catch (err) {
+            lastApiError = err.message || 'Network error';
           }
-        } catch (err) {
-          console.warn('Live Gemini call fallback:', err);
         }
       }
 
-      // Smart Built-in NLP & Slip Parser
-      const raw = (captionText || (file ? file.name.replace(/\.[^/.]+$/, '') : '')).trim();
-      const amountMatch = raw.match(/(?:₹|rs\.?|inr)?\s*(\d+(?:,\d+)*(?:\.\d+)?)/i);
-      const extractedAmount = amountMatch ? parseFloat(amountMatch[1].replace(/,/g, '')) : 15000;
-
+      // Offline fallback if API key is missing or unreachable
+      const raw = (trimmedCaption || (file ? file.name.replace(/\.[^/.]+$/, '') : '')).trim();
+      const amountMatch = raw.match(/(?:|rs\.?|inr)?\s*(\d+(?:,\d+)*(?:\.\d+)?)/i);
+      const extractedAmount = amountMatch ? parseFloat(amountMatch[1].replace(/,/g, '')) : 0;
       const isExpense = /\b(paid|expense|bill|purchase|rent|kseb|paints|vendor|debit|to)\b/i.test(raw);
       const gstMatch = raw.match(/(\d+)\s*%\s*gst/i);
       const extractedGst = gstMatch ? Number(gstMatch[1]) : 0;
 
-      let cleanParty = raw
-        .replace(/(?:₹|rs\.?|inr)?\s*\d+(?:,\d+)*(?:\.\d+)?/gi, '')
-        .replace(/\b(paid|received|from|to|slip|bank|sbi|federal|canara|hdfc|gst|advance|for)\b/gi, '')
-        .replace(/[-_#,]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-
-      if (!cleanParty || cleanParty.length < 2) {
-        cleanParty = file ? 'Customer (' + file.name.replace(/\.[^/.]+$/, '') + ')' : 'Walk-in Customer';
+      let detectedStamp = 'Manual Chat Entry';
+      if (file) {
+        detectedStamp = lastApiError
+          ? `⚠️ Gemini Error: ${lastApiError}`
+          : '⚠️ Click "Connect Live Gemini AI" at top & paste API key';
       }
 
-      let detectedStamp = 'Bank Counter Seal #108';
-      if (/sbi/i.test(raw)) detectedStamp = 'SBI Branch Cash Counter #04';
-      else if (/federal/i.test(raw)) detectedStamp = 'Federal Bank RTGS Seal';
-      else if (/canara/i.test(raw)) detectedStamp = 'Canara Bank Deposit Counter';
-      else if (/hdfc/i.test(raw)) detectedStamp = 'HDFC NEFT Verification Stamp';
-
       return {
-        desc: cleanParty,
+        desc: trimmedCaption || (file ? file.name.replace(/\.[^/.]+$/, '') : 'Walk-in Customer'),
         bankStamp: detectedStamp,
         amount: extractedAmount,
         type: isExpense ? 'expense' : 'income',
